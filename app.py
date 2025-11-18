@@ -341,7 +341,15 @@ def search_jobs():
     }
     """
     try:
-        data = request.json
+        # Check Content-Type header
+        if not request.is_json:
+            return jsonify({
+                'error': 'Invalid Content-Type',
+                'message': 'Content-Type must be application/json',
+                'received': request.content_type
+            }), 415
+        
+        data = request.get_json(force=True)
         
         if not data or 'job_title' not in data:
             return jsonify({
