@@ -6,28 +6,76 @@ import time
 from html import unescape
 import re
 from functools import wraps
+import random
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 CORS(app)
 
-# Rate limiting
+# Cache for storing search results
+cache = {}
+CACHE_DURATION = timedelta(hours=1)  # Cache results for 1 hour
+
+# Rate limiting with backoff
 last_request_time = 0
-MIN_REQUEST_INTERVAL = 3  # seconds between requests
+MIN_REQUEST_INTERVAL = 5  # Increased from 3 to 5 seconds
+request_count = 0
+MAX_REQUESTS_PER_HOUR = 50  # Limit requests per hour
+request_timestamps = []
+
+# User agent rotation for anti-bot
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0"
+]
+
+def get_cache_key(job_title, workplace_types, location_filter, page, size):
+    """Generate cache key for search results"""
+    workplace_str = ','.join(sorted(workplace_types))
+    return f"{job_title}:{workplace_str}:{location_filter}:{page}:{size}"
+
+def check_hourly_limit():
+    """Check if hourly request limit is exceeded"""
+    global request_timestamps
+    now = datetime.now()
+    one_hour_ago = now - timedelta(hours=1)
+    
+    # Remove old timestamps
+    request_timestamps = [ts for ts in request_timestamps if ts > one_hour_ago]
+    
+    if len(request_timestamps) >= MAX_REQUESTS_PER_HOUR:
+        return False
+    return True
 
 def rate_limit(f):
-    """Decorator to enforce rate limiting"""
+    """Decorator to enforce rate limiting with exponential backoff"""
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        global last_request_time
+        global last_request_time, request_count, request_timestamps
+        
+        # Check hourly limit
+        if not check_hourly_limit():
+            return None, f"Hourly request limit ({MAX_REQUESTS_PER_HOUR}) exceeded. Please try again later."
+        
         current_time = time.time()
         time_since_last = current_time - last_request_time
         
-        if time_since_last < MIN_REQUEST_INTERVAL:
-            sleep_time = MIN_REQUEST_INTERVAL - time_since_last
+        # Calculate delay with jitter to avoid pattern detection
+        base_delay = MIN_REQUEST_INTERVAL
+        jitter = random.uniform(0.5, 2.0)
+        required_delay = base_delay + jitter
+        
+        if time_since_last < required_delay:
+            sleep_time = required_delay - time_since_last
             print(f"⏳ Rate limiting: waiting {sleep_time:.1f} seconds...")
             time.sleep(sleep_time)
         
         last_request_time = time.time()
+        request_count += 1
+        request_timestamps.append(datetime.now())
+        
         return f(*args, **kwargs)
     return decorated_function
 
@@ -41,15 +89,15 @@ def clean_html(html_text):
     return text
 
 @rate_limit
-def search_jobs_api(job_title, workplace_types=None, page=0, size=40):
-    """Search for jobs on hiring.cafe"""
+def search_jobs_api(job_title, workplace_types=None, page=0, size=40, max_retries=3):
+    """Search for jobs on hiring.cafe with retry logic"""
     if workplace_types is None:
         workplace_types = ["Remote", "Hybrid", "On-site"]
     
     url = "https://hiring.cafe/api/search-jobs"
     
     payload = {
-        "size": size,
+        "size": min(size, 100),  # Cap at 100
         "page": page,
         "searchState": {
             "workplaceTypes": workplace_types,
@@ -61,50 +109,88 @@ def search_jobs_api(job_title, workplace_types=None, page=0, size=40):
         }
     }
     
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "*/*",
-        "Origin": "https://hiring.cafe",
-        "Referer": f"https://hiring.cafe/?searchState=%7B%22searchQuery%22%3A%22{job_title.replace(' ', '+')}%22%7D",
-        "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Mobile Safari/537.36",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty"
-    }
+    for attempt in range(max_retries):
+        # Rotate user agent
+        user_agent = random.choice(USER_AGENTS)
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "*/*",
+            "Origin": "https://hiring.cafe",
+            "Referer": f"https://hiring.cafe/?searchState=%7B%22searchQuery%22%3A%22{job_title.replace(' ', '+')}%22%7D",
+            "User-Agent": user_agent,
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+            "Accept-Language": "en-US,en;q=0.9"
+        }
+        
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=(10, 30))
+            response.raise_for_status()
+            return response.json(), None
+            
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 403:
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) * 10  # Exponential backoff: 10s, 20s, 40s
+                    print(f"⚠️ Rate limited. Waiting {wait_time}s before retry {attempt + 2}/{max_retries}")
+                    time.sleep(wait_time)
+                    continue
+                return None, "Rate limited by hiring.cafe. Service temporarily unavailable."
+            return None, f"HTTP Error: {e.response.status_code}"
+            
+        except requests.exceptions.Timeout:
+            if attempt < max_retries - 1:
+                print(f"⏳ Timeout. Retrying {attempt + 2}/{max_retries}...")
+                time.sleep(3)
+                continue
+            return None, "Request timeout. Please try again."
+            
+        except Exception as e:
+            return None, str(e)
     
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=(10, 30))
-        response.raise_for_status()
-        return response.json(), None
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 403:
-            return None, "Rate limited by hiring.cafe. Please try again in a few minutes."
-        return None, f"HTTP Error: {e.response.status_code}"
-    except Exception as e:
-        return None, str(e)
+    return None, "Max retries exceeded"
 
 @rate_limit
-def get_job_details_api(job_id):
-    """Get detailed job information by ID"""
+def get_job_details_api(job_id, max_retries=3):
+    """Get detailed job information by ID with retry logic"""
     build_id = "T5BbkPhTrZW7uSyfwsbxs"
     url = f"https://hiring.cafe/_next/data/{build_id}/viewjob/{job_id}.json"
     
-    headers = {
-        "Accept": "*/*",
-        "X-Nextjs-Data": "1",
-        "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
-        "Referer": f"https://hiring.cafe/viewjob/{job_id}"
-    }
+    for attempt in range(max_retries):
+        user_agent = random.choice(USER_AGENTS)
+        
+        headers = {
+            "Accept": "*/*",
+            "X-Nextjs-Data": "1",
+            "User-Agent": user_agent,
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+            "Referer": f"https://hiring.cafe/viewjob/{job_id}"
+        }
+        
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            return response.json(), None
+            
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 403 and attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 10
+                print(f"⚠️ Rate limited. Waiting {wait_time}s before retry {attempt + 2}/{max_retries}")
+                time.sleep(wait_time)
+                continue
+            return None, f"HTTP Error: {e.response.status_code}"
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(2)
+                continue
+            return None, str(e)
     
-    try:
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
-        return response.json(), None
-    except Exception as e:
-        return None, str(e)
+    return None, "Max retries exceeded"
 
 def filter_by_location(jobs, location_filter):
     """Filter jobs by location"""
@@ -179,7 +265,13 @@ def home():
     return jsonify({
         'status': 'online',
         'service': 'Hiring.cafe Job Search API',
-        'version': '1.0.0',
+        'version': '2.0.0',
+        'features': [
+            'Search caching (1 hour)',
+            'Rate limiting with exponential backoff',
+            'User agent rotation',
+            f'Max {MAX_REQUESTS_PER_HOUR} requests per hour'
+        ],
         'endpoints': {
             '/search-jobs': {
                 'method': 'POST',
@@ -196,21 +288,48 @@ def home():
                 'method': 'GET',
                 'description': 'Get detailed job information by ID',
                 'example': '/job/lever___avertium___135159ab-3e8f-4d1d-b811-f8ad0638ea96'
+            },
+            '/stats': {
+                'method': 'GET',
+                'description': 'Get API usage statistics'
             }
         },
-        'rate_limit': f'{MIN_REQUEST_INTERVAL} seconds between requests',
-        'note': 'This API is a proxy to hiring.cafe and respects their rate limits'
+        'rate_limits': {
+            'min_interval': f'{MIN_REQUEST_INTERVAL}s between requests',
+            'max_hourly': f'{MAX_REQUESTS_PER_HOUR} requests per hour',
+            'cache_duration': '1 hour'
+        }
     })
 
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint for Railway"""
-    return jsonify({'status': 'healthy'}), 200
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'requests_made': request_count,
+        'cache_size': len(cache)
+    }), 200
+
+@app.route('/stats', methods=['GET'])
+def stats():
+    """Get API usage statistics"""
+    one_hour_ago = datetime.now() - timedelta(hours=1)
+    recent_requests = len([ts for ts in request_timestamps if ts > one_hour_ago])
+    
+    return jsonify({
+        'total_requests': request_count,
+        'requests_last_hour': recent_requests,
+        'limit_per_hour': MAX_REQUESTS_PER_HOUR,
+        'remaining_this_hour': max(0, MAX_REQUESTS_PER_HOUR - recent_requests),
+        'cache_entries': len(cache),
+        'cache_duration_hours': CACHE_DURATION.total_seconds() / 3600
+    })
 
 @app.route('/search-jobs', methods=['POST'])
 def search_jobs():
     """
-    Search for jobs
+    Search for jobs with caching
     
     Request body:
     {
@@ -218,7 +337,7 @@ def search_jobs():
         "workplace_types": ["Remote", "Hybrid", "On-site"],  // optional
         "location_filter": "United States",  // optional
         "page": 0,  // optional, default 0
-        "size": 40  // optional, default 40
+        "size": 40  // optional, default 40, max 100
     }
     """
     try:
@@ -239,12 +358,30 @@ def search_jobs():
         workplace_types = data.get('workplace_types', ['Remote', 'Hybrid', 'On-site'])
         location_filter = data.get('location_filter')
         page = data.get('page', 0)
-        size = data.get('size', 40)
+        size = min(data.get('size', 40), 100)  # Cap at 100
+        
+        # Check cache first
+        cache_key = get_cache_key(job_title, workplace_types, location_filter, page, size)
+        
+        if cache_key in cache:
+            cache_entry = cache[cache_key]
+            if datetime.now() - cache_entry['timestamp'] < CACHE_DURATION:
+                print(f"✅ Returning cached results for: {job_title}")
+                return jsonify({
+                    'success': True,
+                    'cached': True,
+                    'cached_at': cache_entry['timestamp'].isoformat(),
+                    **cache_entry['data']
+                })
+            else:
+                # Cache expired, remove it
+                del cache[cache_key]
         
         print(f"\n=== JOB SEARCH START ===")
         print(f"Title: {job_title}")
         print(f"Workplace: {workplace_types}")
         print(f"Location filter: {location_filter}")
+        print(f"Size: {size}")
         
         # Search jobs
         results, error = search_jobs_api(job_title, workplace_types, page, size)
@@ -273,12 +410,28 @@ def search_jobs():
         
         print(f"✅ Found {len(formatted_jobs)} jobs (filtered from {total} total)")
         
-        return jsonify({
-            'success': True,
+        response_data = {
             'total': total,
             'filtered': len(formatted_jobs),
             'page': page,
             'jobs': formatted_jobs
+        }
+        
+        # Cache the results
+        cache[cache_key] = {
+            'timestamp': datetime.now(),
+            'data': response_data
+        }
+        
+        # Clean old cache entries (keep max 100)
+        if len(cache) > 100:
+            oldest_key = min(cache.keys(), key=lambda k: cache[k]['timestamp'])
+            del cache[oldest_key]
+        
+        return jsonify({
+            'success': True,
+            'cached': False,
+            **response_data
         })
         
     except Exception as e:
@@ -298,6 +451,18 @@ def get_job(job_id):
     Example: /job/lever___avertium___135159ab-3e8f-4d1d-b811-f8ad0638ea96
     """
     try:
+        # Check cache
+        cache_key = f"job:{job_id}"
+        if cache_key in cache:
+            cache_entry = cache[cache_key]
+            if datetime.now() - cache_entry['timestamp'] < CACHE_DURATION:
+                print(f"✅ Returning cached job details for: {job_id}")
+                return jsonify({
+                    'success': True,
+                    'cached': True,
+                    'job': cache_entry['data']
+                })
+        
         print(f"\n=== JOB DETAILS REQUEST ===")
         print(f"Job ID: {job_id}")
         
@@ -322,9 +487,6 @@ def get_job(job_id):
         
         # Format detailed job data
         job_info = job.get('job_information', {})
-        job_data = job.get('v5_processed_job_data', {})
-        company_data = job.get('v5_processed_company_data', {})
-        
         formatted_job = format_job_data(job)
         
         # Add full description for detailed view
@@ -332,10 +494,17 @@ def get_job(job_id):
         formatted_job['description'] = clean_html(description) if description else None
         formatted_job['description_html'] = description
         
+        # Cache the result
+        cache[cache_key] = {
+            'timestamp': datetime.now(),
+            'data': formatted_job
+        }
+        
         print(f"✅ Job details retrieved: {formatted_job['title']}")
         
         return jsonify({
             'success': True,
+            'cached': False,
             'job': formatted_job
         })
         
@@ -351,5 +520,7 @@ def get_job(job_id):
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     print(f"🚀 Starting Hiring.cafe Job Search API on 0.0.0.0:{port}")
-    print(f"⏱️  Rate limit: {MIN_REQUEST_INTERVAL} seconds between requests")
+    print(f"⏱️  Rate limit: {MIN_REQUEST_INTERVAL}s between requests")
+    print(f"📊 Max requests per hour: {MAX_REQUESTS_PER_HOUR}")
+    print(f"💾 Cache duration: {CACHE_DURATION.total_seconds() / 3600} hours")
     app.run(host='0.0.0.0', port=port, debug=False)
